@@ -1,0 +1,384 @@
+# country-chatbot
+
+A simple C++ command-line AI-powered country information chatbot. This project demonstrates how to fetch real-time data from external REST APIs (using libcurl) and parse JSON responses (using nlohmann/json). The chatbot combines multiple API calls to provide cultural insights, tourist attractions, weather, and cuisines for a given country.
+
+> **Note:** This is a learning/demo project. You must register for any required API keys (e.g., OpenWeatherMap, Google Places) and configure them in `config.example.json`. Never commit real API keys to a public repository.
+
+---
+
+## Repository layout
+
+```
+country-chatbot/
+├── README.md
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── ApiClient.h
+│   ├── ApiClient.cpp
+│   ├── CountryInfo.h
+│   └── CountryInfo.cpp
+├── config.example.json
+└── LICENSE
+```
+
+---
+
+## Build requirements
+
+- C++17-compatible compiler (g++/clang)
+- libcurl development headers
+- nlohmann/json (single-header)
+- CMake
+
+On Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake libcurl4-openssl-dev
+```
+
+Place `json.hpp` (nlohmann/json single header) into `src/` or install via package manager.
+
+---
+
+## `config.example.json`
+
+```json
+{
+  "openweathermap_api_key": "YOUR_OPENWEATHERMAP_KEY",
+  "places_api_key": "YOUR_GOOGLE_PLACES_KEY"
+}
+```
+
+Copy to `config.json` and fill your keys.
+
+---
+
+## `CMakeLists.txt`
+
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(country_chatbot LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(CURL REQUIRED)
+include_directories(${CURL_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(country-chatbot
+  src/main.cpp
+  src/ApiClient.cpp
+  src/CountryInfo.cpp
+)
+
+target_include_directories(country-chatbot PRIVATE src)
+
+target_link_libraries(country-chatbot PRIVATE ${CURL_LIBRARIES})
+```
+
+---
+
+## `src/ApiClient.h`
+
+```cpp
+#pragma once
+
+#include <string>
+#include <optional>
+
+class ApiClient {
+public:
+    ApiClient();
+    ~ApiClient();
+
+    // Simple GET request, returns response body on success
+    std::optional<std::string> get(const std::string &url);
+};
+```
+
+---
+
+## `src/ApiClient.cpp`
+
+```cpp
+#include "ApiClient.h"
+#include <curl/curl.h>
+#include <string>
+#include <iostream>
+
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t realSize = size * nmemb;
+    std::string* mem = static_cast<std::string*>(userp);
+    mem->append(static_cast<char*>(contents), realSize);
+    return realSize;
+}
+
+ApiClient::ApiClient() {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+}
+
+ApiClient::~ApiClient() {
+    curl_global_cleanup();
+}
+
+std::optional<std::string> ApiClient::get(const std::string &url) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return std::nullopt;
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        std::cerr << "curl error: " << curl_easy_strerror(res) << " for URL: " << url << std::endl;
+        curl_easy_cleanup(curl);
+        return std::nullopt;
+    }
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code != 200) {
+        std::cerr << "http error code: " << http_code << " for URL: " << url << std::endl;
+        // still return response for debugging
+    }
+
+    curl_easy_cleanup(curl);
+    return response;
+}
+```
+
+---
+
+## `src/CountryInfo.h`
+
+```cpp
+#pragma once
+
+#include <string>
+#include <optional>
+#include <nlohmann/json.hpp>
+#include "ApiClient.h"
+
+struct CountryInfo {
+    std::string name;
+    std::string capital;
+    std::string region;
+    std::string subregion;
+    std::string population;
+    std::string currencies;
+    std::string languages;
+    std::string flag_url;
+};
+
+class CountryService {
+public:
+    CountryService(ApiClient &client);
+
+    // Fetch general country data using REST Countries API
+    std::optional<CountryInfo> fetchCountryBasic(const std::string &countryName);
+
+    // Fetch current weather for capital using OpenWeatherMap
+    std::optional<std::string> fetchWeather(const std::string &city, const std::string &owmApiKey);
+
+    // Fetch sample attractions using Google Places (textsearch) - user must fill API key
+    std::optional<std::string> fetchAttractions(const std::string &query, const std::string &placesApiKey);
+
+private:
+    ApiClient &client;
+};
+```
+
+---
+
+## `src/CountryInfo.cpp`
+
+```cpp
+#include "CountryInfo.h"
+#include <sstream>
+#include <iostream>
+
+using json = nlohmann::json;
+
+CountryService::CountryService(ApiClient &client) : client(client) {}
+
+std::optional<CountryInfo> CountryService::fetchCountryBasic(const std::string &countryName) {
+    // Use REST Countries v3.1 https://restcountries.com/
+    std::string url = "https://restcountries.com/v3.1/name/" + curl_easy_escape(nullptr, countryName.c_str(), 0);
+    auto resp = client.get(url);
+    if (!resp) return std::nullopt;
+
+    try {
+        auto j = json::parse(*resp);
+        if (!j.is_array() || j.empty()) return std::nullopt;
+        auto c = j[0];
+        CountryInfo info;
+        info.name = c.value("name", json::object()).value("common", "");
+        info.capital = c.value("capital", json::array()).size() ? c["capital"][0].get<std::string>() : "";
+        info.region = c.value("region", "");
+        info.subregion = c.value("subregion", "");
+        info.population = std::to_string(c.value("population", 0));
+
+        // currencies
+        if (c.contains("currencies") && c["currencies"].is_object()) {
+            std::ostringstream cur;
+            for (auto it = c["currencies"].begin(); it != c["currencies"].end(); ++it) {
+                if (it != c["currencies"].begin()) cur << ", ";
+                cur << it.key();
+            }
+            info.currencies = cur.str();
+        }
+
+        // languages
+        if (c.contains("languages") && c["languages"].is_object()) {
+            std::ostringstream lang;
+            for (auto it = c["languages"].begin(); it != c["languages"].end(); ++it) {
+                if (it != c["languages"].begin()) lang << ", ";
+                lang << it.value().get<std::string>();
+            }
+            info.languages = lang.str();
+        }
+
+        // flag
+        if (c.contains("flags") && c["flags"].is_object()) {
+            info.flag_url = c["flags"].value("svg", "");
+        }
+
+        return info;
+    } catch (const std::exception &e) {
+        std::cerr << "json parse error: " << e.what() << std::endl;
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> CountryService::fetchWeather(const std::string &city, const std::string &owmApiKey) {
+    if (owmApiKey.empty()) return std::nullopt;
+    // Simple current weather (metric)
+    std::string url = "https://api.openweathermap.org/data/2.5/weather?q=" + city + "&units=metric&appid=" + owmApiKey;
+    auto resp = client.get(url);
+    if (!resp) return std::nullopt;
+
+    try {
+        auto j = json::parse(*resp);
+        std::ostringstream out;
+        out << j.value("weather", json::array())[0].value("description", "")
+            << ", temp=" << j.value("main", json::object()).value("temp", 0.0);
+        return out.str();
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> CountryService::fetchAttractions(const std::string &query, const std::string &placesApiKey) {
+    if (placesApiKey.empty()) return std::nullopt;
+    // NOTE: Google Places requires proper URL encoding and billing enabled.
+    std::string url = "https://maps.googleapis.com/maps/api/place/textsearch/json?query=" + curl_easy_escape(nullptr, query.c_str(), 0) + "&key=" + placesApiKey;
+    auto resp = client.get(url);
+    if (!resp) return std::nullopt;
+    try {
+        auto j = json::parse(*resp);
+        std::ostringstream out;
+        if (j.contains("results") && j["results"].is_array()) {
+            int count = 0;
+            for (auto &r : j["results"]) {
+                if (count++ >= 5) break;
+                out << r.value("name", "") << " - " << r.value("formatted_address", "") << "\n";
+            }
+        }
+        return out.str();
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+```
+
+---
+
+## `src/main.cpp`
+
+```cpp
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <nlohmann/json.hpp>
+#include "ApiClient.h"
+#include "CountryInfo.h"
+
+using json = nlohmann::json;
+
+json loadConfig(const std::string &path) {
+    std::ifstream f(path);
+    if (!f) return json::object();
+    json j; f >> j; return j;
+}
+
+int main() {
+    std::cout << "Country Chatbot - get insights about any country\n";
+    json cfg = loadConfig("config.json");
+    std::string owm = cfg.value("openweathermap_api_key", "");
+    std::string places = cfg.value("places_api_key", "");
+
+    ApiClient client;
+    CountryService service(client);
+
+    while (true) {
+        std::cout << "\nEnter country name (or 'exit'): ";
+        std::string country; std::getline(std::cin, country);
+        if (country == "exit" || country.empty()) break;
+
+        auto info = service.fetchCountryBasic(country);
+        if (!info) {
+            std::cout << "Could not find country info. Try different name.\n";
+            continue;
+        }
+
+        std::cout << "\nName: " << info->name << "\n";
+        std::cout << "Capital: " << info->capital << "\n";
+        std::cout << "Region: " << info->region << " / " << info->subregion << "\n";
+        std::cout << "Population: " << info->population << "\n";
+        std::cout << "Languages: " << info->languages << "\n";
+        std::cout << "Currencies: " << info->currencies << "\n";
+        std::cout << "Flag: " << info->flag_url << "\n";
+
+        if (!info->capital.empty() && !owm.empty()) {
+            auto weather = service.fetchWeather(info->capital, owm);
+            if (weather) std::cout << "Weather (" << info->capital << "): " << *weather << "\n";
+            else std::cout << "Weather: unavailable or API key missing.\n";
+        }
+
+        if (!places.empty()) {
+            std::string q = "top tourist attractions in " + info->name;
+            auto placesRes = service.fetchAttractions(q, places);
+            if (placesRes) {
+                std::cout << "\nTop attractions:\n" << *placesRes << "\n";
+            } else {
+                std::cout << "Attractions: unavailable or API key missing.\n";
+            }
+        }
+
+        std::cout << "\n--- end of report ---\n";
+    }
+
+    std::cout << "Goodbye!\n";
+    return 0;
+}
+```
+
+---
+
+## Usage & Notes
+
+- Copy `config.example.json` to `config.json` and add API keys.
+- Build using CMake: `mkdir build && cd build && cmake .. && make`.
+- Run `./country-chatbot`.
+- This project is intentionally simple and demonstrates how to integrate HTTP + JSON into a CLI chatbot. For production-grade behavior, add rate-limiting, retry logic, caching, error handling, and respect API usage terms.
+
+---
+
+## License
+
+MIT
